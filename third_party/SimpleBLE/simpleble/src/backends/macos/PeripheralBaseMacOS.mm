@@ -102,11 +102,14 @@
 - (CBCharacteristic*)findCharacteristic:(NSString*)uuid service:(CBService*)service;
 - (std::pair<CBService*, CBCharacteristic*>)findServiceAndCharacteristic:(NSString*)service_uuid
                                                      characteristic_uuid:(NSString*)characteristic_uuid;
+- (void)waitForTask:(BleTask*)task operation:(NSString*)operation;
 - (void)throwBasedOnError:(NSError*)error withFormat:(NSString*)format, ...;
 
 @end
 
 @implementation PeripheralBaseMacOS
+
+static const NSTimeInterval BLE_OPERATION_TIMEOUT_SECONDS = 5.0;
 
 - (instancetype)init:(CBPeripheral*)peripheral centralManager:(CBCentralManager*)centralManager {
     self = [super init];
@@ -144,33 +147,38 @@
 }
 
 - (void)connect {
-    if (self.peripheral.state == CBPeripheralStateConnected) {
+    if (self.peripheral.state == CBPeripheralStateConnected && self.peripheral.services != nil &&
+        self.characteristicExtras.count > 0) {
         return;
     }
 
+    if (self.peripheral.state != CBPeripheralStateConnected) {
+        @synchronized(_task) {
+            // --- Connect to the peripheral ---
+            @synchronized(self) {
+                _task.error = nil;
+                _task.pending = YES;
+                [self.centralManager connectPeripheral:self.peripheral options:@{}];  // TODO: Do we need to pass any options?
+            }
+
+            [self waitForTask:_task operation:@"Peripheral Connection"];
+
+            if (self.peripheral.state != CBPeripheralStateConnected || _task.error != nil) {
+                [self throwBasedOnError:_task.error withFormat:@"Peripheral Connection"];
+            }
+        }
+    }
+
+    // --- Discover services and characteristics ---
+
     @synchronized(_task) {
-        // --- Connect to the peripheral ---
-        @synchronized(self) {
-            _task.error = nil;
-            _task.pending = YES;
-            [self.centralManager connectPeripheral:self.peripheral options:@{}];  // TODO: Do we need to pass any options?
-        }
-
-        WAIT_UNTIL_FALSE_WITH_TIMEOUT(self, _task.pending, 5.0);
-
-        if (self.peripheral.state != CBPeripheralStateConnected || _task.error != nil) {
-            [self throwBasedOnError:_task.error withFormat:@"Peripheral Connection"];
-        }
-
-        // --- Discover services and characteristics ---
-
         @synchronized(self) {
             _task.error = nil;
             _task.pending = YES;
             [self.peripheral discoverServices:nil];
         }
 
-        WAIT_UNTIL_FALSE(self, _task.pending);
+        [self waitForTask:_task operation:@"Service Discovery"];
 
         if (self.peripheral.state != CBPeripheralStateConnected) {
             [self throwBasedOnError:_disconnectionError withFormat:@"Service Discovery"];
@@ -188,7 +196,8 @@
                 [self.peripheral discoverCharacteristics:nil forService:service];
             }
 
-            WAIT_UNTIL_FALSE(self, _task.pending);
+            [self waitForTask:_task
+                    operation:[NSString stringWithFormat:@"Characteristic Discovery for service %@", service.UUID]];
 
             if (self.peripheral.state != CBPeripheralStateConnected) {
                 [self throwBasedOnError:_disconnectionError withFormat:@"Characteristic Discovery for service %@", service.UUID];
@@ -208,7 +217,8 @@
                     [self.peripheral discoverDescriptorsForCharacteristic:characteristic];
                 }
 
-                WAIT_UNTIL_FALSE(self, _task.pending);
+                [self waitForTask:_task
+                        operation:[NSString stringWithFormat:@"Descriptor Discovery for characteristic %@", characteristic.UUID]];
 
                 if (self.peripheral.state != CBPeripheralStateConnected) {
                     [self throwBasedOnError:_disconnectionError
@@ -247,7 +257,7 @@
             [self.centralManager cancelPeripheralConnection:self.peripheral];
         }
 
-        WAIT_UNTIL_FALSE(self, _task.pending);
+        [self waitForTask:_task operation:@"Peripheral Disconnection"];
 
         if (self.peripheral.state != CBPeripheralStateDisconnected) {
             [self throwBasedOnError:_disconnectionError withFormat:@"Peripheral Disconnection"];
@@ -321,7 +331,7 @@
                 [self.peripheral readValueForCharacteristic:characteristic];
             }
 
-            WAIT_UNTIL_FALSE(self, task.pending);
+            [self waitForTask:task operation:[NSString stringWithFormat:@"Characteristic %@ Read", characteristic.UUID]];
 
             if (task.error != nil) {
                 [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Read", characteristic.UUID];
@@ -354,7 +364,7 @@
             [self.peripheral writeValue:payload forCharacteristic:characteristic type:CBCharacteristicWriteWithResponse];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        [self waitForTask:task operation:[NSString stringWithFormat:@"Characteristic %@ Write Request", characteristic.UUID]];
 
         if (task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Write Request", characteristic.UUID];
@@ -404,7 +414,7 @@
             [self.peripheral setNotifyValue:YES forCharacteristic:characteristic];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        [self waitForTask:task operation:[NSString stringWithFormat:@"Characteristic %@ Notify/Indicate", characteristic.UUID]];
 
         if (!characteristic.isNotifying || task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Notify/Indicate", characteristic.UUID];
@@ -435,7 +445,7 @@
             [self.peripheral setNotifyValue:NO forCharacteristic:characteristic];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        [self waitForTask:task operation:[NSString stringWithFormat:@"Characteristic %@ Unsubscribe", characteristic.UUID]];
 
         if (characteristic.isNotifying || task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Characteristic %@ Unsubscribe", characteristic.UUID];
@@ -463,7 +473,7 @@
             [self.peripheral readValueForDescriptor:descriptor];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        [self waitForTask:task operation:[NSString stringWithFormat:@"Descriptor %@ Read", descriptor.UUID]];
 
         if (task.error != nil) {
             [self throwBasedOnError:task.error withFormat:@"Descriptor %@ Read", descriptor.UUID];
@@ -496,7 +506,7 @@
             [self.peripheral writeValue:payload forDescriptor:descriptor];
         }
 
-        WAIT_UNTIL_FALSE(self, task.pending);
+        [self waitForTask:task operation:[NSString stringWithFormat:@"Descriptor %@ Write", descriptor.UUID]];
 
         if (task.error) {
             [self throwBasedOnError:task.error withFormat:@"Descriptor %@ Write", descriptor.UUID];
@@ -544,6 +554,26 @@
     }
 
     throw SimpleBLE::Exception::DescriptorNotFound([uuid UTF8String]);
+}
+
+- (void)waitForTask:(BleTask*)task operation:(NSString*)operation {
+    NSDate* endDate = [NSDate dateWithTimeInterval:BLE_OPERATION_TIMEOUT_SECONDS sinceDate:NSDate.now];
+    while ([NSDate.now compare:endDate] == NSOrderedAscending) {
+        @synchronized(self) {
+            if (!task.pending) {
+                return;
+            }
+        }
+        [NSThread sleepForTimeInterval:0.01];
+    }
+
+    @synchronized(self) {
+        task.pending = NO;
+    }
+    NSString* exceptionMessage =
+        [NSString stringWithFormat:@"%@ timed out after %.1f seconds", operation, BLE_OPERATION_TIMEOUT_SECONDS];
+    NSLog(@"%@", exceptionMessage);
+    throw SimpleBLE::Exception::OperationFailed([exceptionMessage UTF8String]);
 }
 
 - (std::pair<CBService*, CBCharacteristic*>)findServiceAndCharacteristic:(NSString*)service_uuid
